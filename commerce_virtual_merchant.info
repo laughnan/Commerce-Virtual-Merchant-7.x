@@ -1,0 +1,6 @@
+name = Commerce Virtual Merchant
+description = Provides a payment method for clients of Virtual Merchant.
+package = Commerce
+dependencies[] = commerce
+dependencies[] = commerce_payment
+core = 7.x
