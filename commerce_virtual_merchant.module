@@ -14,13 +14,72 @@ function commerce_virtual_merchant_commerce_payment_method_info() {
   $payment_methods = array();
 
   $payment_methods['commerce_virtual_merchant'] = array(
-    'title' => t('Example payment'),
-    'description' => t('Demonstrates complete payment during checkout and serves as a development example.'),
+    'base' => 'commerce_virtual_merchant',
+    'title' => t('Virtual Merchant'),
+    'short_title' => t('Virtual Merchant'),
+    'display_title' => t('Credit Card'),
+    'description' => t('Integrates Virtual Merchant credit card transactions.'),
     'active' => TRUE,
   );
 
   return $payment_methods;
 }
+
+/**
+ * Implements payment callback for settings form.
+ */
+function commerce_virtual_merchant_settings_form($settings = NULL) {
+
+  $form = array();
+
+  // Merge default settings into the stored settings array.
+
+  $settings = (array) $settings + array(
+    'merchant_id' => '',
+    'user_id' => '',
+    'pin' => '',
+    'mode' => 'test',
+  );
+
+  $form['merchant_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant ID'),
+    '#description' => t('Your merchant ID is the Account number you use to login at Virtual Merchant.'),
+    '#default_value' => $settings['merchant_id'],
+    '#required' => TRUE,
+  );
+
+  $form['user_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('User ID'),
+    '#description' => t('Same as the user ID you use to login at Virtual Merchant.'),
+    '#default_value' => $settings['user_id'],
+    '#required' => TRUE,
+  );
+  
+  $form['pin'] = array(
+    '#type' => 'textfield',
+    '#title' => t('PIN'),
+    '#description' => t('Found through the User > Change PIN menu item at Virtual Merchant.'),
+    '#default_value' => $settings['pin'],
+    '#required' => TRUE,
+  );
+
+  $form['mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction mode'),
+    '#description' => t('Make sure you update to production mode when your site goes live!'),
+    '#options' => array(
+      'production' => t('Production'),
+      'test' => t('Test'),
+      'demo' => t('Demo server'),
+    ),
+    '#default_value' => $settings['mode'],
+  );
+
+  return $form;
+
+} // commerce_virtual_merchant_settings_form
 
 /**
  * Payment method callback: submit form.
