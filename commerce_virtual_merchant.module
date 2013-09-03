@@ -85,40 +85,22 @@ function commerce_virtual_merchant_settings_form($settings = NULL) {
  * Payment method callback: submit form.
  */
 function commerce_virtual_merchant_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
-  $form = array();
-
-  // Merge in values from the order.
-  if (!empty($order->data['commerce_virtual_merchant'])) {
-    $pane_values += $order->data['commerce_virtual_merchant'];
-  }
-
-  // Merge in default values.
-  $pane_values += array(
-    'name' => '',
-  );
-
-  $form['name'] = array(
-    '#type' => 'textfield',
-    '#title' => t('Name'),
-    '#description' => t('This is a demonstration field coded to fail validation for single character values.'),
-    '#default_value' => $pane_values['name'],
-    '#required' => TRUE,
-  );
-
-  return $form;
+    module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+  return commerce_payment_credit_card_form(array('code' => '', 'owner' => ''));
 }
 
 /**
  * Payment method callback: submit form validation.
  */
 function commerce_virtual_merchant_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
-  // Throw an error if a long enough name was not provided.
-  if (strlen($pane_values['name']) < 2) {
-    form_set_error(implode('][', array_merge($form_parents, array('name'))), t('You must enter a name two or more characters long.'));
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
 
-    // Even though the form error is enough to stop the submission of the form,
-    // it's not enough to stop it from a Commerce standpoint because of the
-    // combined validation / submission going on per-pane in the checkout form.
+  // Validate the credit card fields.
+  $settings = array(
+    'form_parents' => array_merge($form_parents, array('credit_card')),
+  );
+
+  if (!commerce_payment_credit_card_validate($pane_values['credit_card'], $settings)) {
     return FALSE;
   }
 }
@@ -127,9 +109,184 @@ function commerce_virtual_merchant_submit_form_validate($payment_method, $pane_f
  * Payment method callback: submit form submission.
  */
 function commerce_virtual_merchant_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
-  $order->data['commerce_virtual_merchant'] = $pane_values;
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
 
-  commerce_virtual_merchant_transaction($payment_method, $order, $charge, $pane_values['name']);
+  // Prepare a description of the order.
+  $description = array();
+  
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      $description[] = round($line_item_wrapper->quantity->value(), 2) . 'x ' . $line_item_wrapper->line_item_label->value();
+    } // foreach
+  } // foreach
+
+  // Prepare the billing address for use in the request.
+  $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+  // Prepare the parameters that we will submit to process the transaction.
+  $param = array(
+    // Transaction information.
+    'ssl_testmode' => 'FALSE',
+    'ssl_transaction_type' => 'CCSALE',
+
+    // API access credentials.
+    'ssl_merchant_id' => $payment_method['settings']['merchant_id'],
+    'ssl_user_id' => $payment_method['settings']['user_id'],
+    'ssl_pin' => $payment_method['settings']['pin'],
+
+    // Transaction amount.
+    'ssl_amount' => number_format(commerce_currency_amount_to_decimal($charge['amount'], $charge['currency_code']), 2, '.', ''),
+    'ssl_salestax'=> '0', // Always passed as 0 for the merchant provided form.
+
+    // Payment details.
+    'ssl_card_number' => $pane_values['credit_card']['number'],
+    'ssl_exp_date' => sprintf('%02d%02d', $pane_values['credit_card']['exp_month'], substr($pane_values['credit_card']['exp_year'], -2)),
+
+    // Order details.
+    'ssl_description' => substr(implode(' / ', $description), 0, 255),
+    'ssl_invoice_number' => $order->order_id,
+    'ssl_customer_code' => $order->uid,
+
+    // Billing address.
+    'ssl_company' => substr($billing_address['organisation_name'], 0, 50),
+    'ssl_first_name' => substr($billing_address['first_name'], 0, 20),
+    'ssl_last_name' => substr($billing_address['last_name'], 0, 30),
+    'ssl_avs_address' => substr($billing_address['thoroughfare'], 0, 20),
+    'ssl_address2' => substr($billing_address['premise'], 0, 20),
+    'ssl_city' => substr($billing_address['locality'], 0, 30),
+    'ssl_state' => substr($billing_address['administrative_area'], 0, 30),
+    'ssl_avs_zip' => substr($billing_address['postal_code'], 0, 9),
+    'ssl_country' => $billing_address['country'],
+    'ssl_phone' => '',
+    'ssl_email' => substr(preg_replace('/\+.+@/', '@', $order->mail), 0, 100), // remove plus addressing (virtual merchant doesnt accept it)
+
+    // Payment configuration.
+    'ssl_show_form' => 'FALSE',
+    'ssl_result_format' => 'ASCII',
+  );
+
+  // Update the order for test mode if enabled.
+  if ($payment_method['settings']['mode'] != 'production') {
+    $param['ssl_testmode'] = 'TRUE';
+
+    // When testing, amount must be less than $50.
+    if ($param['ssl_amount'] >= 50) {
+      $param['ssl_amount'] = '49.99';
+    } // if
+  } // if
+
+  // Include the CVV data if enabled.
+  if (isset($pane_values['credit_card']['code'])) {
+    $param['ssl_cvv2cvc2_indicator'] = '1';
+    $param['ssl_cvv2cvc2'] = $pane_values['credit_card']['code'];
+  } // if
+
+  // Set the proper URL based on the transaction mode.
+  $url = 'https://www.myvirtualmerchant.com/VirtualMerchant/process.do';
+  if ($payment_method['settings']['mode'] == 'demo') {
+    $url = 'https://demo.myvirtualmerchant.com/VirtualMerchantDemo/process.do';
+  } // if
+
+  // format the post data
+  foreach ($param as $key=>$value) {
+    $postdata[] = $key . '=' . urlencode($value);
+  }
+  $postdata = implode('&', $postdata);
+
+  // curl to virtual merchant... something's wrong with drupal_http_request and was causing errors
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, $url);
+  curl_setopt($ch, CURLOPT_VERBOSE, 0);
+  curl_setopt($ch, CURLOPT_POST, 1);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, $postdata);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+  $authorize = curl_exec($ch);
+  if ($error = curl_error($ch)) {
+    watchdog('commerce_virtual_merchant', $error, WATCHDOG_ERROR);
+    $success = FALSE;
+    $txn_message = t('An error occured while trying to contact the payment gateway.');
+  }
+  curl_close($ch);
+
+  // Put the results into an associative array.
+  parse_str(str_replace(array("\r", "\n"), array('', '&'), trim($authorize)), $response);
+
+  // fail with a virtual merchant error
+  if (isset($response['errorCode'])) {
+    $success = FALSE;
+    $txn_message = t('Credit card payment declined: !response', array('!response', $response['errorMessage']));
+  }
+
+  // fail with a transaction error
+  else if ($response['ssl_result'] != '0') {
+    $fail_definitions = array(
+      'APPROVAL PARTIAL' => t('Approved for a Partial Amount'),
+      'DECLINE CVV2' => t('Declined due to CVV2 mismatch \ failure'),
+      'PICK UP CARD' => t('Pick up card'),
+      'AMOUNT ERROR' => t('Tran Amount Error'),
+      'AMT OVER SVC LMT' => t('Amount is more than established service limit'),
+      'APPL TYPE ERROR' => t('Call for Assistance'),
+      'CANNOT CONVERT' => t('Check is ok, but cannot be converted. Do Not Honor'),
+      'DECLINED' => t('Do Not Honor'),
+      'DECLINED T4' => t('Do Not Honor. Failed negative check, unpaid items'),
+      'DECLINED-HELP 9999' => t('System Error'),
+      'DUP CHECK NBR' => t('Duplicate Check Number'),
+      'EXPIRED CARD' => t('Expired Card'),
+      'INCORRECT PIN' => t('Invalid PIN'),
+      'INVALID CARD' => t('Invalid Card'),
+      'INVALID CAVV' => t('Invalid Cardholder Authentication Verification Value'),
+      'INVALID TERM ID' => t('Invalid Terminal ID'),
+      'INVLD R/T NBR' => t('Invalid Routing/Transit Number'),
+      'INVLD TERM ID 1' => t('Invalid Merchant Number'),
+      'INVLD TERM ID 2' => t('Invalid SE Number'),
+      'INVLD VOID DATA' => t('Invalid Data Submitted for Void Transaction'),
+      'MAX MONTHLY VOL' => t('The maximum monthly volume has been reached'),
+      'MICR ERROR' => t('MICR Read Error'),
+      'MUST SETTLE MMDD' => t('Must settle, open batch is over 7 days old.'),
+      'NETWORK ERROR' => t('General System Error'),
+      'PLEASE RETRY' => t('Please Retry/ Reenter Transaction'),
+      'RECORD NOT FOUND' => t('Record not on the network'),
+      'REQ. EXCEEDS BAL.' => t('Req. exceeds balance'),
+      'SEQ ERR PLS CALL' => t('Call for Assistance'),
+      'SERV NOT ALLOWED' => t('Invalid request'),
+      'TOO MANY CHECKS' => t('Too Many Checks (Over Limit)'),
+      'CALL AUTH. CENTER' => t('Refer to Issuer'),
+    );
+    
+    $success = FALSE;
+    if (isset($fail_definitions[$response['ssl_result_message']])) {
+      $txn_message = t('Credit card payment was declined: !response', array('!response' => $fail_definitions[$response['ssl_result_message']]));
+    }
+    else {
+      $txn_message = t('Credit card payment was declined');
+    }
+  } // else if
+
+  // else, the transaction was successful!
+  else {
+    $success = TRUE;
+    $txn_message = t('The transaction was successful');
+  } // else
+
+  // record the transaaction
+  $transaction = commerce_payment_transaction_new('commerce_virtual_merchant', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->status = ($success)? COMMERCE_PAYMENT_STATUS_SUCCESS : COMMERCE_PAYMENT_STATUS_FAILURE;
+  $transaction->remote_id = (isset($response['ssl_txn_id']))? $response['ssl_txn_id'] : t('N/A');
+  $transaction->remote_status = (isset($response['ssl_result_message']))? $response['ssl_result_message'] : '';
+  $transaction->message = $txn_message;
+
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+
+  // send the error message to the user
+  if (!$success) {
+    drupal_set_message($txn_message, 'error');
+    return FALSE;
+  }
 }
 
 /**
@@ -143,15 +300,7 @@ function commerce_virtual_merchant_submit_form_submit($payment_method, $pane_for
  *   An array indicating the amount and currency code to charge.
  * @param $name
  *   The name entered on the submission form.
+ * @todo integrate this with Commerce Virtual Merchant (Drupal 7)
  */
 function commerce_virtual_merchant_transaction($payment_method, $order, $charge, $name) {
-  $transaction = commerce_payment_transaction_new('commerce_virtual_merchant', $order->order_id);
-  $transaction->instance_id = $payment_method['instance_id'];
-  $transaction->amount = $charge['amount'];
-  $transaction->currency_code = $charge['currency_code'];
-  $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
-  $transaction->message = 'Name: @name';
-  $transaction->message_variables = array('@name' => $name);
-
-  commerce_payment_transaction_save($transaction);
 }
